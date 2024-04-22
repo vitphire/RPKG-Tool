@@ -68,6 +68,7 @@ public:
     void get_root_scenes();
 
     void map_recursive_temp_loader(uint32_t rpkg_index, uint64_t hash_value);
+    void map_recursive_temp_loader(uint32_t rpkg_index, const hash& hash_obj);
 
     static void
     import_map(std::string& input_path, std::string& map_path, std::string& qn_format, std::string& output_path);
@@ -90,7 +91,13 @@ public:
     bool matrixes_equal(matrix43& matrix1, matrix43& matrix2);
 
     std::vector<map_node> map_nodes;
+    /*
+     * map: temp hash (uint64_t) -> index in map_temps (uint64_t)
+     */
     std::unordered_map<uint64_t, uint64_t> map_temps_map;
+    /*
+     * vector of temp objects
+     */
     std::vector<temp> map_temps;
     std::unordered_map<uint64_t, uint64_t> map_prims_map;
     std::vector<uint64_t> map_prims;

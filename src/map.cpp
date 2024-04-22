@@ -16,574 +16,495 @@
 #include <rapidjson/stringbuffer.h>
 #include <DirectXMath.h>
 
+
+#define ERROR_AND_RETURN_IF(condition, task_status) \
+    if ((condition)) { \
+        task_status_string = (task_status); \
+        task_map_status = MAP_ERROR; \
+        LOG_AND_RETURN(task_status_string); \
+    }
+
+#define LOG_TIMING(task_status) \
+    LOG(task_status); \
+    timing_string = task_status;
+
 map::map() = default;
 
-map::map(uint64_t hash_value) {
+map::map(uint64_t hash_value) {}
 
+// returns false if the map_filters_s are malformed.
+bool get_default_map_filters(std::string map_filters_s, map& temp_map) {
+    struct map_filter {
+        std::string name;
+        bool* target;
+        std::string log_description;
+        bool found = false;
+    };
+    std::vector<map_filter> map_filter_options = {
+            {"BOXES",   &temp_map.map_filter_volume_boxes,
+                    "Nodes With Volume Boxes"},
+            {"SPHERES", &temp_map.map_filter_volume_spheres,
+                    "Nodes With Volume Spheres"},
+            {"VISIBLE", &temp_map.map_filter_visible,
+                    "Hide Nodes With m__bVisible==False In Godot"},
+    };
+
+    if (!map_filters_s.empty()) {
+        map_filters_s = util::to_upper_case(map_filters_s);
+        std::regex map_filters_regex("(?:[, ]+|^)([^, ]+)=(TRUE|FALSE)");
+        for (std::smatch sm; std::regex_search(map_filters_s, sm, map_filters_regex);
+             map_filters_s = sm.suffix()) {
+            std::string temp_map_filter = sm[1].str();
+            std::string temp_map_filter_value = sm[2].str();
+            bool recognized = false;
+            for (auto& option : map_filter_options) {
+                if (option.name == temp_map_filter) {
+                    if (option.found) { return false; } // Fail if the same option is specified multiple times.
+                    option.found = true;
+                    *option.target = (temp_map_filter_value == "TRUE");
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) { return false; } // Fail if an unrecognized option is specified.
+        }
+        if (!map_filters_s.empty()) { return false; } // Fail if there are any remaining characters in the string.
+        LOG("Filters set via -map_filter:");
+        for (const auto& option : map_filter_options) {
+            if (option.found)
+                LOG("  " + option.log_description + ": " + util::bool_to_string(*option.target));
+        }
+        LOG("Using default map filter values for:");
+    } else {
+        LOG("No value for -map_filter specified, using the defaults:");
+    }
+    for (const auto& option : map_filter_options) {
+        if (!option.found)
+            LOG("  " + option.log_description + ": " + util::bool_to_string(*option.target));
+    }
+    return true;
 }
 
-void map::export_map(std::string& input_path, std::string& filter, std::string& map_filters, std::string& output_path,
+void map::export_map(std::string& input_path, std::string& filter,
+                     std::string& map_filters, std::string& output_path,
                      bool textured) {
     log_output = false;
 
+    // Path to the folder containing the RPKG files
     std::string input_rpkg_folder_path = file::parse_input_folder_path(input_path);
+    ERROR_AND_RETURN_IF(!file::path_exists(input_rpkg_folder_path),
+                        "Error: The folder " + input_rpkg_folder_path +
+                        " to search for RPKG files for map editor mode does not exist.")
 
-    if (file::path_exists(input_rpkg_folder_path)) {
-        if (!hash_list_loaded) {
-            LOG("Loading Hash List...");
-            generic_function::load_hash_list(false);
-            LOG("Loading Hash List: Done");
+    // Getting the hash value from the filter
+    std::vector<std::string> filters = util::parse_input_filter(filter);
+    ERROR_AND_RETURN_IF(filters.size() != 1,
+                        "Error: This function only takes one hash filter value, "
+                        "and it should be the root map entity TEMP hash value.")
+    // The hash value specified by -filter
+    uint64_t hash_value = std::strtoull(filters.at(0).c_str(), nullptr, 16);
+
+    map temp_map(hash_value);
+
+    // Parsing the -map_filters
+    bool filters_malformed = !get_default_map_filters(map_filters, temp_map);
+    ERROR_AND_RETURN_IF(filters_malformed, "Error: The input value for -map_filter is malformed.")
+
+    // Loading the hash list
+    if (!hash_list_loaded) {
+        LOG("Loading Hash List...");
+        generic_function::load_hash_list(false);
+        LOG("Loading Hash List: Done");
+    }
+
+    // Loading the RPKG files in the input folder
+    rpkg_function::import_rpkg_files_in_folder(input_rpkg_folder_path);
+
+    // Finding which RPKG file the hash appears in
+    uint32_t rpkg_index = rpkg_function::get_latest_hash(hash_value);
+    ERROR_AND_RETURN_IF(rpkg_index == UINT32_MAX,
+                        "Error: The input entity (TEMP) hash " + filters.at(0) +
+                        " could not be found in any RPKGs.")
+
+    // Finding the hash in the RPKG file
+    auto iterator_hash = rpkgs.at(rpkg_index).hash_map.find(hash_value);
+    ERROR_AND_RETURN_IF(iterator_hash == rpkgs.at(rpkg_index).hash_map.end(),
+                        "Error: The input entity (TEMP) hash " + filters.at(0) +
+                        " could not be found in " + rpkgs.at(rpkg_index).rpkg_file_name + ".")
+    hash hash = rpkgs.at(rpkg_index).hash.at(iterator_hash->second);
+
+    // Creating the output folder
+    std::string map_hash_file_name = util::uint64_t_to_hex_string(hash.hash_value)
+                                     + "." + hash.hash_resource_type;
+    output_path = file::output_path_append("MAP_" + map_hash_file_name, output_path);
+    file::create_directories(output_path);
+
+    // Finding every TEMP and TBLU entity that is recursively linked to the root entity
+    task_map_status = MAP_RECURSIVE_TEMP_LOADING_EXECUTING;
+    LOG_TIMING("Calculating number of recursive entities (TEMP/TBLU)...")
+    temp_map.map_recursive_temp_loader(rpkg_index, hash_value);
+    LOG_TIMING("Number of recursive entities (TEMP/TBLU) found: " +
+               util::uint32_t_to_string(temp_map.map_temps.size()))
+
+    temp_map.start_time = std::chrono::high_resolution_clock::now();
+    temp_map.stringstream_length = 80;
+    temp_map.message = "Loading recursive TEMP/TBLU entities: ";
+    timing_string = temp_map.message + "0% done";
+
+    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
+        if (gui_control == ABORT_CURRENT_TASK) { return; }
+
+        if (((t * (uint64_t) 10000) / (uint64_t) temp_map.map_temps.size()) % (uint64_t) 10 == 0 && t > 0) {
+            temp_map.stringstream_length =
+                    console::update_console(temp_map.message, temp_map.map_temps.size(),
+                                            t, temp_map.start_time, temp_map.stringstream_length);
         }
 
-        rpkg_function::import_rpkg_files_in_folder(input_rpkg_folder_path);
+        map_percent_progress_recursive_temp = percent_progress;
 
-        std::vector<std::string> filters = util::parse_input_filter(filter);
-
-        if (filters.size() != 1) {
-            task_status_string = "Error: This function only takes one hash filter value, and it should be the root map entity TEMP hash value.";
-
-            task_map_status = MAP_ERROR;
-
-            LOG_AND_RETURN(task_status_string);
+        if (temp_map.map_temps.at(t).tblu_return_value == TEMP_TBLU_FOUND) {
+            temp_map.map_temps.at(t).load_data();
         }
+    }
 
-        uint64_t hash_value = std::strtoull(filters.at(0).c_str(), nullptr, 16);
+    temp_map.end_time = std::chrono::high_resolution_clock::now();
+    std::stringstream ss;
+    ss << temp_map.message << "100% Done in " << (
+            0.000000001 *
+            std::chrono::duration_cast<std::chrono::duration<double>>(
+                    temp_map.end_time - temp_map.start_time).count()) << "s";
+    LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
+    timing_string = ss.str();
 
-        uint32_t rpkg_index = rpkg_function::get_latest_hash(hash_value);
+    temp_map.root_scenes[hash_value] = temp_map.root_scenes.size();
 
-        if (rpkg_index == UINT32_MAX) {
-            task_status_string =
-                    "Error: The input entity (TEMP) hash " + filters.at(0) + " could not be found in any RPKGs.";
+    temp_map.get_root_scenes();
 
-            task_map_status = MAP_ERROR;
+    //std::unordered_map<uint64_t, uint64_t>::iterator it;
 
-            LOG_AND_RETURN(task_status_string);
+    //for (it = temp_map.root_scenes.begin(); it != temp_map.root_scenes.end(); ++it)
+    //{
+    //std::cout << "Root scenes (TEMPs): " << util::uint64_t_to_hex_string(it->first) << std::endl;
+    //}
+
+    task_map_status = MAP_GET_MAP_NODES_EXECUTING;
+
+    LOG("Calculating number of map nodes...");
+    timing_string = "Calculating number of map node...";
+    temp_map.map_node_count = 0;
+
+    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
+        const rapidjson::Value& temp_json_subEntities = temp_map.map_temps.at(t).temp_json_document["subEntities"];
+
+        temp_map.map_node_count += temp_json_subEntities.Size();
+    }
+
+    LOG("Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count));
+    timing_string = "Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count);
+    temp_map.start_time = std::chrono::high_resolution_clock::now();
+    temp_map.stringstream_length = 80;
+    temp_map.message = "Loading map nodes: ";
+    timing_string = temp_map.message + "0% done";
+    temp_map.map_node_count_current = 0;
+
+    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
+        temp_map.get_map_node(temp_map.map_temps.at(t));
+    }
+
+    temp_map.end_time = std::chrono::high_resolution_clock::now();
+    ss.str(std::string(""));
+    ss << temp_map.message << "100% Done in " << (0.000000001 *
+                                                  std::chrono::duration_cast<std::chrono::duration<double>>(
+                                                          temp_map.end_time - temp_map.start_time).count()) << "s";
+    LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
+    timing_string = ss.str();
+
+    task_map_status = MAP_EXTRACT_MAP_NODES_PRIMS_EXECUTING;
+
+    LOG("Calculating number of map nodes with PRIMs...");
+    timing_string = "Calculating number of map node with PRIMs...";
+    temp_map.map_node_prim_count = 0;
+
+    for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++) {
+        if (temp_map.map_nodes.at(m).has_prim_resource) {
+            temp_map.map_node_prim_count++;
         }
+    }
 
-        auto ith = rpkgs.at(rpkg_index).hash_map.find(hash_value);
+    LOG("Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count));
+    timing_string =
+            "Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count);
+    temp_map.start_time = std::chrono::high_resolution_clock::now();
+    temp_map.stringstream_length = 80;
+    temp_map.message = "Extracting all map's PRIMs as GLBs: ";
+    timing_string = temp_map.message + "0% done";
+    temp_map.map_node_count_current = 0;
 
-        std::string map_hash_file_name = "";
+    temp_map.extract_map_prims(output_path, textured);
 
-        if (ith != rpkgs.at(rpkg_index).hash_map.end()) {
-            map_hash_file_name =
-                    util::uint64_t_to_hex_string(rpkgs.at(rpkg_index).hash.at(ith->second).hash_value) + "." +
-                    rpkgs.at(rpkg_index).hash.at(ith->second).hash_resource_type;
-        } else {
-            task_status_string =
-                    "Error: The input entity (TEMP) hash " + filters.at(0) + " could not be found in any RPKGs.";
+    temp_map.end_time = std::chrono::high_resolution_clock::now();
+    ss.str(std::string(""));
+    ss << temp_map.message << "100% Done in " << (0.000000001 *
+                                                  std::chrono::duration_cast<std::chrono::duration<double>>(
+                                                          temp_map.end_time - temp_map.start_time).count()) << "s";
+    LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
+    timing_string = ss.str();
 
-            task_map_status = MAP_ERROR;
+    /*for (uint64_t matches = 0; matches < temp_map.map_nodes.size(); matches++)
+    {
+        std::cout << std::endl;
+        std::cout << "temp_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).temp_hash) << std::endl;
+        std::cout << "entityId: " << temp_map.map_nodes.at(matches).entityId << std::endl;
+        std::cout << "subEntity: " << temp_map.map_nodes.at(matches).subEntity << std::endl;
+        std::cout << "entryName: " << temp_map.map_nodes.at(matches).entryName << std::endl;
+        std::cout << "entityTypeResourceIndex: " << temp_map.map_nodes.at(matches).entityTypeResourceIndex << std::endl;
+        std::cout << "entityTypeResourceIndex_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).entityTypeResourceIndex_hash) << std::endl;
+        std::cout << "entityTypeResourceIndex_hash_type: " << temp_map.map_nodes.at(matches).entityTypeResourceIndex_hash_type << std::endl;
 
-            LOG_AND_RETURN(task_status_string);
-        }
+        std::unordered_map<uint64_t, uint64_t>::iterator it2 = hash_list_hash_map.find(temp_map.map_nodes.at(matches).entityTypeResourceIndex_hash);
 
-        output_path = file::output_path_append("MAP_" + map_hash_file_name, output_path);
-
-        file::create_directories(output_path);
-
-        map temp_map(hash_value);
-
-        std::vector<std::string> map_filters_values;
-
-        std::smatch m;
-        std::regex re("^([^, ]+)[, ]+");
-        std::regex_search(map_filters, m, re);
-
-        if (!m.empty()) {
-            map_filters_values.push_back(util::to_upper_case(m[1].str()));
-
-            std::smatch m2;
-            re.assign("[, ]+([^, ]+)");
-
-            while (std::regex_search(map_filters, m2, re)) {
-                map_filters_values.push_back(util::to_upper_case(m2[1].str()));
-
-                map_filters = m2.suffix().str();
-            }
-        } else {
-            if (!map_filters.empty()) {
-                map_filters_values.push_back(util::to_upper_case(map_filters));
-            }
-        }
-
-        if (map_filters_values.empty()) {
-            LOG("No value for -map_filter specified, using the defaults:");
-            LOG("Nodes With Volume Boxes: " + util::bool_to_string(temp_map.map_filter_volume_boxes));
-            LOG("Nodes With Volume Spheres: " + util::bool_to_string(temp_map.map_filter_volume_spheres));
-            LOG("Hide Nodes With m__bVisible==False In Godot: " + util::bool_to_string(temp_map.map_filter_visible));
-        } else {
-            bool map_filter_volume_boxes_found = false;
-            bool map_filter_volume_spheres_found = false;
-            bool map_filter_visible_found = false;
-
-            for (const auto& map_filters_value : map_filters_values) {
-                bool filters_malformed = false;
-
-                size_t pos = map_filters_value.find('=');
-
-                if (pos != std::string::npos) {
-                    std::string temp_map_filter = util::to_upper_case(map_filters_value.substr(0, pos));
-                    std::string temp_map_filter_value = util::to_upper_case(map_filters_value.substr(pos + 1));
-
-                    if (temp_map_filter.empty() || temp_map_filter_value.empty()) {
-                        filters_malformed = true;
-                    } else {
-                        if (temp_map_filter_value == "TRUE" || temp_map_filter_value == "FALSE") {
-                            if (temp_map_filter == "BOXES") {
-                                map_filter_volume_boxes_found = true;
-
-                                if (temp_map_filter_value == "TRUE") {
-                                    temp_map.map_filter_volume_boxes = true;
-                                } else if (temp_map_filter_value == "FALSE") {
-                                    temp_map.map_filter_volume_boxes = false;
-                                }
-                            } else if (temp_map_filter == "SPHERES") {
-                                map_filter_volume_spheres_found = true;
-
-                                if (temp_map_filter_value == "TRUE") {
-                                    temp_map.map_filter_volume_spheres = true;
-                                } else if (temp_map_filter_value == "FALSE") {
-                                    temp_map.map_filter_volume_spheres = false;
-                                }
-                            } else if (temp_map_filter == "VISIBLE") {
-                                map_filter_visible_found = true;
-
-                                if (temp_map_filter_value == "TRUE") {
-                                    temp_map.map_filter_visible = true;
-                                } else if (temp_map_filter_value == "FALSE") {
-                                    temp_map.map_filter_visible = false;
-                                }
-                            }
-                        } else {
-                            filters_malformed = true;
-                        }
-                    }
-                } else {
-                    filters_malformed = true;
-                }
-
-                if (filters_malformed) {
-                    task_status_string = "Error: The input value for -map_filters is malformed.";
-
-                    task_map_status = MAP_ERROR;
-
-                    LOG_AND_RETURN(task_status_string);
-                }
-            }
-
-            if (map_filter_volume_boxes_found || map_filter_volume_spheres_found || map_filter_visible_found) {
-                LOG("Filters set via -map_filter:");
-
-                if (map_filter_volume_boxes_found) {
-                    LOG("Nodes With Volume Boxes: " + util::bool_to_string(temp_map.map_filter_volume_boxes));
-                }
-
-                if (map_filter_volume_spheres_found) {
-                    LOG("Nodes With Volume Spheres: " + util::bool_to_string(temp_map.map_filter_volume_spheres));
-                }
-
-                if (map_filter_visible_found) {
-                    LOG("Hide Nodes With m__bVisible==False In Godot: " +
-                        util::bool_to_string(temp_map.map_filter_visible));
-                }
-            }
-
-            if (!map_filter_volume_boxes_found || !map_filter_volume_spheres_found || !map_filter_visible_found) {
-                LOG("Using default map filter values for:");
-
-                if (!map_filter_volume_boxes_found) {
-                    LOG("Nodes With Volume Boxes: " + util::bool_to_string(temp_map.map_filter_volume_boxes));
-                }
-
-                if (!map_filter_volume_spheres_found) {
-                    LOG("Nodes With Volume Spheres: " + util::bool_to_string(temp_map.map_filter_volume_spheres));
-                }
-
-                if (!map_filter_visible_found) {
-                    LOG("Hide Nodes With m_bVisible==False In Godot: " +
-                        util::bool_to_string(temp_map.map_filter_visible));
-                }
-            }
-        }
-
-        task_map_status = MAP_RECURSIVE_TEMP_LOADING_EXECUTING;
-
-        LOG("Calculating number of recursive entities (TEMP/TBLU)...");
-        timing_string = "Calculating number of recursive entities (TEMP/TBLU)...";
-
-        temp_map.map_recursive_temp_loader(rpkg_index, hash_value);
-
-        LOG("Number of recursive entities (TEMP/TBLU) found: " + util::uint32_t_to_string(temp_map.map_temps.size()));
-        timing_string = "Number of recursive entities (TEMP/TBLU) found: " +
-                        util::uint32_t_to_string(temp_map.map_temps.size());
-        temp_map.start_time = std::chrono::high_resolution_clock::now();
-        temp_map.stringstream_length = 80;
-        temp_map.message = "Loading recursive TEMP/TBLU entities: ";
-        timing_string = temp_map.message + "0% done";
-
-        for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
-            if (gui_control == ABORT_CURRENT_TASK) {
-                return;
-            }
-
-            if (((t * (uint64_t) 10000) / (uint64_t) temp_map.map_temps.size()) % (uint64_t) 10 == 0 && t > 0) {
-                temp_map.stringstream_length = console::update_console(temp_map.message, temp_map.map_temps.size(), t,
-                                                                       temp_map.start_time,
-                                                                       temp_map.stringstream_length);
-            }
-
-            map_percent_progress_recursive_temp = percent_progress;
-
-            if (temp_map.map_temps.at(t).tblu_return_value == TEMP_TBLU_FOUND) {
-                temp_map.map_temps.at(t).load_data();
-            }
-        }
-
-        temp_map.end_time = std::chrono::high_resolution_clock::now();
-        std::stringstream ss;
-        ss << temp_map.message << "100% Done in " << (0.000000001 *
-                                                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                              temp_map.end_time - temp_map.start_time).count()) << "s";
-        LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
-        timing_string = ss.str();
-
-        temp_map.root_scenes[hash_value] = temp_map.root_scenes.size();
-
-        temp_map.get_root_scenes();
-
-        //std::unordered_map<uint64_t, uint64_t>::iterator it;
-
-        //for (it = temp_map.root_scenes.begin(); it != temp_map.root_scenes.end(); ++it)
-        //{
-        //std::cout << "Root scenes (TEMPs): " << util::uint64_t_to_hex_string(it->first) << std::endl;
-        //}
-
-        task_map_status = MAP_GET_MAP_NODES_EXECUTING;
-
-        LOG("Calculating number of map nodes...");
-        timing_string = "Calculating number of map node...";
-        temp_map.map_node_count = 0;
-
-        for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
-            const rapidjson::Value& temp_json_subEntities = temp_map.map_temps.at(t).temp_json_document["subEntities"];
-
-            temp_map.map_node_count += temp_json_subEntities.Size();
-        }
-
-        LOG("Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count));
-        timing_string = "Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count);
-        temp_map.start_time = std::chrono::high_resolution_clock::now();
-        temp_map.stringstream_length = 80;
-        temp_map.message = "Loading map nodes: ";
-        timing_string = temp_map.message + "0% done";
-        temp_map.map_node_count_current = 0;
-
-        for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
-            temp_map.get_map_node(temp_map.map_temps.at(t));
-        }
-
-        temp_map.end_time = std::chrono::high_resolution_clock::now();
-        ss.str(std::string(""));
-        ss << temp_map.message << "100% Done in " << (0.000000001 *
-                                                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                              temp_map.end_time - temp_map.start_time).count()) << "s";
-        LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
-        timing_string = ss.str();
-
-        task_map_status = MAP_EXTRACT_MAP_NODES_PRIMS_EXECUTING;
-
-        LOG("Calculating number of map nodes with PRIMs...");
-        timing_string = "Calculating number of map node with PRIMs...";
-        temp_map.map_node_prim_count = 0;
-
-        for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++) {
-            if (temp_map.map_nodes.at(m).has_prim_resource) {
-                temp_map.map_node_prim_count++;
-            }
-        }
-
-        LOG("Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count));
-        timing_string =
-                "Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count);
-        temp_map.start_time = std::chrono::high_resolution_clock::now();
-        temp_map.stringstream_length = 80;
-        temp_map.message = "Extracting all map's PRIMs as GLBs: ";
-        timing_string = temp_map.message + "0% done";
-        temp_map.map_node_count_current = 0;
-
-        temp_map.extract_map_prims(output_path, textured);
-
-        temp_map.end_time = std::chrono::high_resolution_clock::now();
-        ss.str(std::string(""));
-        ss << temp_map.message << "100% Done in " << (0.000000001 *
-                                                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                              temp_map.end_time - temp_map.start_time).count()) << "s";
-        LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
-        timing_string = ss.str();
-
-        /*for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++)
+        if (it2 != hash_list_hash_map.end())
         {
-            std::cout << std::endl;
-            std::cout << "temp_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).temp_hash) << std::endl;
-            std::cout << "entityId: " << temp_map.map_nodes.at(m).entityId << std::endl;
-            std::cout << "subEntity: " << temp_map.map_nodes.at(m).subEntity << std::endl;
-            std::cout << "entryName: " << temp_map.map_nodes.at(m).entryName << std::endl;
-            std::cout << "entityTypeResourceIndex: " << temp_map.map_nodes.at(m).entityTypeResourceIndex << std::endl;
-            std::cout << "entityTypeResourceIndex_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).entityTypeResourceIndex_hash) << std::endl;
-            std::cout << "entityTypeResourceIndex_hash_type: " << temp_map.map_nodes.at(m).entityTypeResourceIndex_hash_type << std::endl;
+            std::cout << "entityTypeResourceIndex_hash IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
+        }
 
-            std::unordered_map<uint64_t, uint64_t>::iterator it2 = hash_list_hash_map.find(temp_map.map_nodes.at(m).entityTypeResourceIndex_hash);
+        if (temp_map.map_nodes.at(matches).has_m_eidParent)
+        {
+            std::cout << "has_m_eidParent: " << temp_map.map_nodes.at(matches).has_m_eidParent << std::endl;
+            std::cout << "has_m_eidParent_local: " << temp_map.map_nodes.at(matches).has_m_eidParent_local << std::endl;
+            std::cout << "has_m_eidParent_external: " << temp_map.map_nodes.at(matches).has_m_eidParent_external << std::endl;
+            std::cout << "entityID: " << temp_map.map_nodes.at(matches).entityID << std::endl;
+            std::cout << "externalSceneIndex: " << temp_map.map_nodes.at(matches).externalSceneIndex << std::endl;
 
-            if (it2 != hash_list_hash_map.end())
+            if (temp_map.map_nodes.at(matches).has_m_eidParent_external)
             {
-                std::cout << "entityTypeResourceIndex_hash IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
-            }
+                std::cout << "externalSceneIndex_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).externalSceneIndex_hash) << std::endl;
 
-            if (temp_map.map_nodes.at(m).has_m_eidParent)
-            {
-                std::cout << "has_m_eidParent: " << temp_map.map_nodes.at(m).has_m_eidParent << std::endl;
-                std::cout << "has_m_eidParent_local: " << temp_map.map_nodes.at(m).has_m_eidParent_local << std::endl;
-                std::cout << "has_m_eidParent_external: " << temp_map.map_nodes.at(m).has_m_eidParent_external << std::endl;
-                std::cout << "entityID: " << temp_map.map_nodes.at(m).entityID << std::endl;
-                std::cout << "externalSceneIndex: " << temp_map.map_nodes.at(m).externalSceneIndex << std::endl;
-
-                if (temp_map.map_nodes.at(m).has_m_eidParent_external)
-                {
-                    std::cout << "externalSceneIndex_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).externalSceneIndex_hash) << std::endl;
-
-                    std::unordered_map<uint64_t, uint64_t>::iterator it2 = hash_list_hash_map.find(temp_map.map_nodes.at(m).externalSceneIndex_hash);
-
-                    if (it2 != hash_list_hash_map.end())
-                    {
-                        std::cout << "externalSceneIndex_hash IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
-                    }
-                }
-
-                std::cout << "entityIndex: " << temp_map.map_nodes.at(m).entityIndex << std::endl;
-            }
-
-            if (temp_map.map_nodes.at(m).has_m_mTransform)
-            {
-                std::cout << "has_m_mTransform: " << temp_map.map_nodes.at(m).has_m_mTransform << std::endl;
-            }
-
-            //std::cout << "m_mTransform:" << map_nodes.at(m).m_mTransform << std::endl;
-
-            if (temp_map.map_nodes.at(m).has_prim_resource)
-            {
-                std::cout << "has_prim_resource: " << temp_map.map_nodes.at(m).has_prim_resource << std::endl;
-                std::cout << "prim_hash: " << temp_map.map_nodes.at(m).prim_hash << std::endl;
-                std::cout << "m_IDHigh: " << temp_map.map_nodes.at(m).m_IDHigh << std::endl;
-                std::cout << "m_IDLow: " << temp_map.map_nodes.at(m).m_IDLow << std::endl;
-                std::cout << "prim_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).prim_hash) << std::endl;
-
-                it2 = hash_list_hash_map.find(temp_map.map_nodes.at(m).prim_hash);
+                std::unordered_map<uint64_t, uint64_t>::iterator it2 = hash_list_hash_map.find(temp_map.map_nodes.at(matches).externalSceneIndex_hash);
 
                 if (it2 != hash_list_hash_map.end())
                 {
-                    std::cout << "PRIM file IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
+                    std::cout << "externalSceneIndex_hash IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
                 }
             }
-        }*/
 
-        for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++) {
-            bool is_parent_node_local = false;
-            bool temp_has_m_eidParents = false;
-            uint32_t local_temp_entity_count = 0;
+            std::cout << "entityIndex: " << temp_map.map_nodes.at(matches).entityIndex << std::endl;
+        }
 
-            auto it = temp_map.temp_hash_map_node_map.find(temp_map.map_nodes.at(m).temp_hash);
+        if (temp_map.map_nodes.at(matches).has_m_mTransform)
+        {
+            std::cout << "has_m_mTransform: " << temp_map.map_nodes.at(matches).has_m_mTransform << std::endl;
+        }
 
-            if (it != temp_map.temp_hash_map_node_map.end()) {
-                for (unsigned int n : it->second) {
-                    if (temp_map.map_nodes.at(n).has_m_eidParent_local) {
-                        local_temp_entity_count++;
+        //std::cout << "m_mTransform:" << map_nodes.at(matches).m_mTransform << std::endl;
 
-                        temp_has_m_eidParents = true;
+        if (temp_map.map_nodes.at(matches).has_prim_resource)
+        {
+            std::cout << "has_prim_resource: " << temp_map.map_nodes.at(matches).has_prim_resource << std::endl;
+            std::cout << "prim_hash: " << temp_map.map_nodes.at(matches).prim_hash << std::endl;
+            std::cout << "m_IDHigh: " << temp_map.map_nodes.at(matches).m_IDHigh << std::endl;
+            std::cout << "m_IDLow: " << temp_map.map_nodes.at(matches).m_IDLow << std::endl;
+            std::cout << "prim_hash: " << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).prim_hash) << std::endl;
 
-                        if (temp_map.map_nodes.at(m).subEntity == temp_map.map_nodes.at(n).entityIndex) {
-                            //std::cout << temp_map.map_nodes.at(m).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).temp_hash) << ")" << " is an m_eidParent to " << temp_map.map_nodes.at(n).entryName << std::endl;
+            it2 = hash_list_hash_map.find(temp_map.map_nodes.at(matches).prim_hash);
 
-                            is_parent_node_local = true;
-                        }
+            if (it2 != hash_list_hash_map.end())
+            {
+                std::cout << "PRIM file IOI string: " << hash_list_hash_strings.at(it2->second) << std::endl;
+            }
+        }
+    }*/
+
+    for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++) {
+        bool is_parent_node_local = false;
+        bool temp_has_m_eidParents = false;
+        uint32_t local_temp_entity_count = 0;
+
+        auto it = temp_map.temp_hash_map_node_map.find(temp_map.map_nodes.at(m).temp_hash);
+
+        if (it != temp_map.temp_hash_map_node_map.end()) {
+            for (unsigned int n : it->second) {
+                if (temp_map.map_nodes.at(n).has_m_eidParent_local) {
+                    local_temp_entity_count++;
+
+                    temp_has_m_eidParents = true;
+
+                    if (temp_map.map_nodes.at(m).subEntity == temp_map.map_nodes.at(n).entityIndex) {
+                        //std::cout << temp_map.map_nodes.at(matches).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).temp_hash) << ")" << " is an m_eidParent to " << temp_map.map_nodes.at(n).entryName << std::endl;
+
+                        is_parent_node_local = true;
                     }
                 }
             }
+        }
 
-            if (local_temp_entity_count == 0 || (!temp_has_m_eidParents && local_temp_entity_count > 0)) {
-                is_parent_node_local = true;
-            }
+        if (local_temp_entity_count == 0 || (!temp_has_m_eidParents && local_temp_entity_count > 0)) {
+            is_parent_node_local = true;
+        }
 
-            bool in_root_scene = false;
+        bool in_root_scene = false;
 
-            for (auto it2 = temp_map.root_scenes.begin(); it2 != temp_map.root_scenes.end(); ++it2) {
-                if (temp_map.map_nodes.at(m).temp_hash == it2->first) {
-                    //std::cout << temp_map.map_nodes.at(m).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).temp_hash) << ")" << " is in root scene " << util::uint64_t_to_hex_string(it->first) << std::endl;
+        for (auto it2 = temp_map.root_scenes.begin(); it2 != temp_map.root_scenes.end(); ++it2) {
+            if (temp_map.map_nodes.at(m).temp_hash == it2->first) {
+                //std::cout << temp_map.map_nodes.at(matches).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).temp_hash) << ")" << " is in root scene " << util::uint64_t_to_hex_string(it->first) << std::endl;
 
-                    in_root_scene = true;
-                }
-            }
-
-            if (!temp_map.map_nodes.at(m).has_m_eidParent && is_parent_node_local && in_root_scene) {
-                //std::cout << temp_map.map_nodes.at(m).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).temp_hash) << ")" << " is a root scene top level map node!" << std::endl;
-
-                temp_map.map_nodes.at(m).is_top_level_root_node = true;
-
-                bool map_root_node_found = false;
-
-                for (unsigned int map_root_node : temp_map.map_root_nodes) {
-                    if (m == map_root_node) {
-                        map_root_node_found = true;
-                    }
-                }
-
-                if (!map_root_node_found) {
-                    temp_map.map_root_nodes.push_back(m);
-                }
-            } else if (!temp_map.map_nodes.at(m).has_m_eidParent && is_parent_node_local) {
-                //std::cout << temp_map.map_nodes.at(m).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).temp_hash) << ")" << " is a local top level map node!" << std::endl;
-
-                temp_map.map_nodes.at(m).is_top_level_Local_node = true;
-
-                temp_map.add_to_temp_hash_is_top_level_Local_node_map(m, temp_map.map_nodes.at(m).temp_hash);
+                in_root_scene = true;
             }
         }
 
-        temp_map.godot_tscn_file =
-                "[gd_scene load_steps=" + util::uint32_t_to_string(temp_map.map_prims.size() + 2) + " format=3]\n\n";
+        if (!temp_map.map_nodes.at(m).has_m_eidParent && is_parent_node_local && in_root_scene) {
+            //std::cout << temp_map.map_nodes.at(matches).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).temp_hash) << ")" << " is a root scene top level map node!" << std::endl;
 
-        for (uint64_t p = 0; p < temp_map.map_prims.size(); p++) {
-            std::string prim_hash_string = util::uint64_t_to_hex_string(temp_map.map_prims.at(p));
+            temp_map.map_nodes.at(m).is_top_level_root_node = true;
 
-            temp_map.godot_tscn_file +=
-                    R"([ext_resource type="PackedScene" path="res://)" + prim_hash_string + ".PRIM.glb\" id=" +
-                    util::uint32_t_to_string(p) + "]\n";
+            bool map_root_node_found = false;
+
+            for (unsigned int map_root_node : temp_map.map_root_nodes) {
+                if (m == map_root_node) {
+                    map_root_node_found = true;
+                }
+            }
+
+            if (!map_root_node_found) {
+                temp_map.map_root_nodes.push_back(m);
+            }
+        } else if (!temp_map.map_nodes.at(m).has_m_eidParent && is_parent_node_local) {
+            //std::cout << temp_map.map_nodes.at(matches).entryName << "(" << util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).temp_hash) << ")" << " is a local top level map node!" << std::endl;
+
+            temp_map.map_nodes.at(m).is_top_level_Local_node = true;
+
+            temp_map.add_to_temp_hash_is_top_level_Local_node_map(m, temp_map.map_nodes.at(m).temp_hash);
         }
+    }
 
-        temp_map.godot_tscn_file += "[node name=\"Node3D\" type=\"Node3D\"]\n";
-        temp_map.godot_tscn_file += "transform = Transform3D(1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0)\n\n";
+    temp_map.godot_tscn_file =
+            "[gd_scene load_steps=" + util::uint32_t_to_string(temp_map.map_prims.size() + 2) + " format=3]\n\n";
 
-        task_map_status = MAP_GENERATE_GODOT_PROJECT_EXECUTING;
+    for (uint64_t p = 0; p < temp_map.map_prims.size(); p++) {
+        std::string prim_hash_string = util::uint64_t_to_hex_string(temp_map.map_prims.at(p));
 
-        temp_map.start_time = std::chrono::high_resolution_clock::now();
-        temp_map.stringstream_length = 80;
-        temp_map.message = "Generating Godot project files: ";
-        timing_string = temp_map.message + "0% done";
-        temp_map.map_node_count_current = 0;
+        temp_map.godot_tscn_file +=
+                R"([ext_resource type="PackedScene" path="res://)" + prim_hash_string + ".PRIM.glb\" id=" +
+                util::uint32_t_to_string(p) + "]\n";
+    }
 
-        for (uint32_t m = 0; m < temp_map.map_root_nodes.size(); m++) {
-            temp_map.generate_map_node_strings(temp_map.map_root_nodes.at(m), 0, "", 0);
-        }
+    temp_map.godot_tscn_file += "[node name=\"Node3D\" type=\"Node3D\"]\n";
+    temp_map.godot_tscn_file += "transform = Transform3D(1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0)\n\n";
 
-        /*std::string UE5_file = "map_root_nodes=";
+    task_map_status = MAP_GENERATE_GODOT_PROJECT_EXECUTING;
 
-        for (uint32_t m = 0; m < temp_map.map_root_nodes.size(); m++)
+    temp_map.start_time = std::chrono::high_resolution_clock::now();
+    temp_map.stringstream_length = 80;
+    temp_map.message = "Generating Godot project files: ";
+    timing_string = temp_map.message + "0% done";
+    temp_map.map_node_count_current = 0;
+
+    for (uint32_t m = 0; m < temp_map.map_root_nodes.size(); m++) {
+        temp_map.generate_map_node_strings(temp_map.map_root_nodes.at(m), 0, "", 0);
+    }
+
+    /*std::string UE5_file = "map_root_nodes=";
+
+    for (uint32_t matches = 0; matches < temp_map.map_root_nodes.size(); matches++)
+    {
+        UE5_file += util::uint32_t_to_string(temp_map.map_root_nodes.at(matches));
+
+        if (matches < (temp_map.map_root_nodes.size() - 1))
         {
-            UE5_file += util::uint32_t_to_string(temp_map.map_root_nodes.at(m));
-
-            if (m < (temp_map.map_root_nodes.size() - 1))
-            {
-                UE5_file += ",";
-            }
+            UE5_file += ",";
         }
+    }
 
-        UE5_file += "\n";
+    UE5_file += "\n";
 
-        for (uint32_t m = 0; m < temp_map.map_nodes.size(); m++)
+    for (uint32_t matches = 0; matches < temp_map.map_nodes.size(); matches++)
+    {
+        if (temp_map.map_nodes.at(matches).has_parent_map_node)
         {
-            if (temp_map.map_nodes.at(m).has_parent_map_node)
-            {
-                UE5_file += util::uint32_t_to_string(m) + ",";
+            UE5_file += util::uint32_t_to_string(matches) + ",";
 
-                for (uint32_t p = 0; p < temp_map.map_nodes.at(m).parent_map_nodes.size(); p++)
+            for (uint32_t p = 0; p < temp_map.map_nodes.at(matches).parent_map_nodes.size(); p++)
+            {
+                UE5_file += util::uint32_t_to_string(temp_map.map_nodes.at(matches).parent_map_nodes.at(p));
+
+                if (p < (temp_map.map_nodes.at(matches).parent_map_nodes.size() - 1))
                 {
-                    UE5_file += util::uint32_t_to_string(temp_map.map_nodes.at(m).parent_map_nodes.at(p));
-
-                    if (p < (temp_map.map_nodes.at(m).parent_map_nodes.size() - 1))
-                    {
-                        UE5_file += "|";
-                    }
-                    else
-                    {
-                        UE5_file += ",";
-                    }
+                    UE5_file += "|";
                 }
-
-                UE5_file += temp_map.map_nodes.at(m).type + ",";
-                UE5_file += temp_map.map_nodes.at(m).m_mTransform_string + ",";
-                UE5_file += temp_map.map_nodes.at(m).has_prim_resource ? "1," : "0,";
-                UE5_file += util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).prim_hash) + ",";
-                UE5_file += util::string_to_hex_string(temp_map.map_nodes.at(m).entryName) + "\n";
-            }
-            else
-            {
-                for (uint32_t n = 0; n < temp_map.map_root_nodes.size(); n++)
+                else
                 {
-                    if (m == temp_map.map_root_nodes.at(n))
-                    {
-                        UE5_file += util::uint32_t_to_string(m) + ",";
-                        UE5_file += "0,";
-                        UE5_file += temp_map.map_nodes.at(m).type + ",";
-                        UE5_file += "1,0,0,0,1,0,0,0,1,0,0,0,";
-                        UE5_file += temp_map.map_nodes.at(m).has_prim_resource ? "1," : "0,";
-                        UE5_file += util::uint64_t_to_hex_string(temp_map.map_nodes.at(m).prim_hash) + ",";
-                        UE5_file += util::string_to_hex_string(temp_map.map_nodes.at(m).entryName) + "\n";
-                    }
+                    UE5_file += ",";
+                }
+            }
+
+            UE5_file += temp_map.map_nodes.at(matches).type + ",";
+            UE5_file += temp_map.map_nodes.at(matches).m_mTransform_string + ",";
+            UE5_file += temp_map.map_nodes.at(matches).has_prim_resource ? "1," : "0,";
+            UE5_file += util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).prim_hash) + ",";
+            UE5_file += util::string_to_hex_string(temp_map.map_nodes.at(matches).entryName) + "\n";
+        }
+        else
+        {
+            for (uint32_t n = 0; n < temp_map.map_root_nodes.size(); n++)
+            {
+                if (matches == temp_map.map_root_nodes.at(n))
+                {
+                    UE5_file += util::uint32_t_to_string(matches) + ",";
+                    UE5_file += "0,";
+                    UE5_file += temp_map.map_nodes.at(matches).type + ",";
+                    UE5_file += "1,0,0,0,1,0,0,0,1,0,0,0,";
+                    UE5_file += temp_map.map_nodes.at(matches).has_prim_resource ? "1," : "0,";
+                    UE5_file += util::uint64_t_to_hex_string(temp_map.map_nodes.at(matches).prim_hash) + ",";
+                    UE5_file += util::string_to_hex_string(temp_map.map_nodes.at(matches).entryName) + "\n";
                 }
             }
         }
+    }
 
-        if (!file::write_to_file(file::output_path_append("UE5.txt", output_path), UE5_file))
-        {
-            LOG("Error: File " + file::output_path_append("UE5.txt", output_path) + " could not be created.");
-        }*/
+    if (!file::write_to_file(file::output_path_append("UE5.txt", output_path), UE5_file))
+    {
+        LOG("Error: File " + file::output_path_append("UE5.txt", output_path) + " could not be created.");
+    }*/
 
-        //std::cout << temp_map.godot_tscn_file << std::endl;
+    //std::cout << temp_map.godot_tscn_file << std::endl;
 
-        std::string godot_godot_file = "config_version = 5\n\n";
-        godot_godot_file += "[application]\n\n";
-        godot_godot_file += "config/name=\"map\"\n";
-        godot_godot_file += "run/main_scene=\"res://" + map_hash_file_name + ".tscn\"\n";
-        godot_godot_file += "config/icon=\"res://icon.png\"\n";
-        godot_godot_file += "config/features=PackedStringArray(\"4.0\", \"Vulkan Clustered\")\n";
-        godot_godot_file += "[memory]\n";
-        godot_godot_file += "limits/message_queue/max_size_kb = 2048000\n";
+    std::string godot_godot_file = "config_version = 5\n\n";
+    godot_godot_file += "[application]\n\n";
+    godot_godot_file += "config/name=\"map\"\n";
+    godot_godot_file += "run/main_scene=\"res://" + map_hash_file_name + ".tscn\"\n";
+    godot_godot_file += "config/icon=\"res://icon.png\"\n";
+    godot_godot_file += "config/features=PackedStringArray(\"4.0\", \"Vulkan Clustered\")\n";
+    godot_godot_file += "[memory]\n";
+    godot_godot_file += "limits/message_queue/max_size_kb = 2048000\n";
 
-        if (!file::write_to_file(file::output_path_append(map_hash_file_name + ".tscn", output_path),
-                                 temp_map.godot_tscn_file)) {
-            task_status_string = "Error: File " + file::output_path_append(map_hash_file_name + ".tscn", output_path) +
-                                 " could not be created.";
-
-            task_map_status = MAP_ERROR;
-
-            LOG_AND_RETURN(task_status_string);
-        }
-
-        if (!file::write_to_file(file::output_path_append("project.godot", output_path), godot_godot_file)) {
-            task_status_string =
-                    "Error: File " + file::output_path_append("project.godot", output_path) + " could not be created.";
-
-            task_map_status = MAP_ERROR;
-
-            LOG_AND_RETURN(task_status_string);
-        }
-
-        temp_map.end_time = std::chrono::high_resolution_clock::now();
-        ss.str(std::string(""));
-        ss << temp_map.message << "100% Done in " << (0.000000001 *
-                                                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                              temp_map.end_time - temp_map.start_time).count()) << "s";
-        LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
-        timing_string = ss.str();
-
-        task_map_status = MAP_EXPORT_SUCCESSFUL;
-    } else {
-        task_status_string = "Error: The folder " + input_rpkg_folder_path +
-                             " to search for RPKG files for map editor mode does not exist.";
+    if (!file::write_to_file(file::output_path_append(map_hash_file_name + ".tscn", output_path),
+                             temp_map.godot_tscn_file)) {
+        task_status_string = "Error: File " + file::output_path_append(map_hash_file_name + ".tscn", output_path) +
+                             " could not be created.";
 
         task_map_status = MAP_ERROR;
 
         LOG_AND_RETURN(task_status_string);
     }
+
+    if (!file::write_to_file(file::output_path_append("project.godot", output_path), godot_godot_file)) {
+        task_status_string =
+                "Error: File " + file::output_path_append("project.godot", output_path) + " could not be created.";
+
+        task_map_status = MAP_ERROR;
+
+        LOG_AND_RETURN(task_status_string);
+    }
+
+    temp_map.end_time = std::chrono::high_resolution_clock::now();
+    ss.str(std::string(""));
+    ss << temp_map.message << "100% Done in " << (0.000000001 *
+                                                  std::chrono::duration_cast<std::chrono::duration<double>>(
+                                                          temp_map.end_time - temp_map.start_time).count()) << "s";
+    LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
+    timing_string = ss.str();
+
+    task_map_status = MAP_EXPORT_SUCCESSFUL;
 
     log_output = true;
 }
@@ -660,10 +581,10 @@ void map::import_map(std::string& input_path, std::string& map_path, std::string
 
     for (const auto& entry : std::filesystem::directory_iterator(map_path)) {
         if (map_root_hash_string.empty()) {
-            std::cout << entry.path().string() << std::endl;
+            std::cout << entry.path().string() << '\n';
 
             if (std::filesystem::is_regular_file(entry.path().string())) {
-                std::cout << entry.path().string() << std::endl;
+                std::cout << entry.path().string() << '\n';
 
                 std::size_t pos = entry.path().string().find_last_of("\\/");
 
@@ -761,7 +682,7 @@ void map::import_map(std::string& input_path, std::string& map_path, std::string
     }
 
     input_file.seekg(0, std::ifstream::end);
-    uint64_t input_file_size = (uint64_t) input_file.tellg();
+    int64_t input_file_size = input_file.tellg();
     input_file.seekg(0, std::ifstream::beg);
     std::string godot_scene_file(input_file_size, '\0');
     input_file.read(&godot_scene_file[0], input_file_size);
@@ -990,8 +911,9 @@ void map::import_map(std::string& input_path, std::string& map_path, std::string
 
     temp_map.end_time = std::chrono::high_resolution_clock::now();
     std::stringstream ss;
-    ss << temp_map.message << "100% Done in " << (0.000000001 * std::chrono::duration_cast<std::chrono::nanoseconds>(
-            temp_map.end_time - temp_map.start_time).count()) << "s";
+    ss << temp_map.message << "100% Done in " << (0.000000001 *
+                                                  std::chrono::duration_cast<std::chrono::duration<double>>(
+                                                          temp_map.end_time - temp_map.start_time).count()) << "s";
     LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
     timing_string = ss.str();
 
@@ -2103,9 +2025,8 @@ bool map::extract_scale_from_transform(matrix43& transform, vector3& scale) {
     return scaled;
 }
 
-void
-map::generate_map_node_strings(uint32_t root_map_node, uint32_t parent_map_node, const std::string& map_node_string,
-                               uint32_t level) {
+void map::generate_map_node_strings(uint32_t root_map_node, uint32_t parent_map_node,
+                                    const std::string& map_node_string, uint32_t level) {
     if (gui_control == ABORT_CURRENT_TASK) {
         return;
     }
@@ -3620,128 +3541,112 @@ void map::get_root_scenes() {
     }
 }
 
-void map::map_recursive_temp_loader(uint32_t rpkg_index, uint64_t hash_value) {
-    auto it = map_temps_map.find(hash_value);
+void map::map_recursive_temp_loader(const uint32_t rpkg_index, const uint64_t hash_value) {
+    const rpkg& rpkg_obj = rpkgs.at(rpkg_index); // rpkg containing the TEMP file
+    // Find index of hash value in rpkg_index.hash_map
+    const auto iterator = rpkg_obj.hash_map.find(hash_value);
+    if (iterator == rpkg_obj.hash_map.end()) {
+        LOG_AND_RETURN("Error: Hash " + util::uint64_t_to_hex_string(hash_value) + " not found in hash map.");
+    }
+    map_recursive_temp_loader(rpkg_index, rpkg_obj.hash.at(iterator->second));
+}
 
-    if (it != map_temps_map.end()) {
-        //std::cout << hash_value << " was already found/added." << std::endl;
+void map::map_recursive_temp_loader(const uint32_t rpkg_index, const hash& hash_obj) { // NOLINT(*-no-recursion)
+    if (hash_obj.hash_resource_type == "TEMP") {
+        uint64_t hash_value = hash_obj.hash_value;
+        // Skip if the hash value is already loaded.
+        if (map_temps_map.find(hash_value) != map_temps_map.end()) { return; }
+        const rpkg& rpkg_obj = rpkgs.at(rpkg_index); // rpkg containing the TEMP file
+        // Find index of hash value in rpkg_index.hash_map
+        const auto iterator = rpkg_obj.hash_map.find(hash_value);
+        if (iterator == rpkg_obj.hash_map.end()) {
+            LOG_AND_RETURN("Error: Hash " + util::uint64_t_to_hex_string(hash_value) + " not found in hash map.");
+        }
+        const uint64_t hash_index = iterator->second; // Index of hash value in rpkg_index.hash
 
-        return;
+        map_temps.emplace_back(rpkg_index, hash_index, 3);
+        map_temps_map[hash_value] = map_temps_map.size();
     }
 
-    map_temps_map[hash_value] = map_temps_map.size();
+    const temp& temp = map_temps.at(map_temps.size() - 1);
+    if (temp.tblu_return_value != TEMP_TBLU_FOUND) {
+        LOG_AND_RETURN("Error: TEMP file " + temp.temp_file_name + " has wrong tblu_return_value.");
+    }
 
-    it = rpkgs.at(rpkg_index).hash_map.find(hash_value);
+    // Sanity check
+    uint32_t temp_hash_reference_count =
+            hash_obj.hash_reference_data.hash_reference_count & 0x3FFFFFFF;
+    if (hash_obj.hash_reference_data.hash_reference.size() != temp_hash_reference_count) {
+        LOG_AND_EXIT("Error: The hash reference count does not match the actual number of hash references.");
+    }
 
-    if (it != rpkgs.at(rpkg_index).hash_map.end()) {
-        map_temps.emplace_back(temp(rpkg_index, it->second, 3));
+    // Loop through dependencies of TEMP / ASET file
+    for (uint64_t hash_reference_value : hash_obj.hash_reference_data.hash_reference) {
+        // Find rpkg of dependency
+        uint32_t dependency_rpkg_index = rpkg_function::get_latest_hash(hash_reference_value);
+        if (dependency_rpkg_index == UINT32_MAX) { continue; }
+        const rpkg& dependency_rpkg = rpkgs.at(dependency_rpkg_index); // rpkg object of dependency
 
-        uint32_t temp_index = map_temps.size() - 1;
+        // Find hash of dependency in rpkg
+        const auto dependency_it = dependency_rpkg.hash_map.find(hash_reference_value);
+        if (dependency_it == dependency_rpkg.hash_map.end()) { continue; }
+        const auto& dependency_hash_obj =
+                dependency_rpkg.hash.at(dependency_it->second); // hash object of dependency
 
-        //map_temps.at(temp_index).load_data();
-
-        if (map_temps.at(temp_index).tblu_return_value == TEMP_TBLU_FOUND) {
-            //std::cout << std::endl << "Processing TEMP file: " << map_temps.at(temp_index).temp_file_name << std::endl;
-
-            std::vector<uint32_t> prims_index_in_hash_depends;
-            std::vector<std::string> prims_index_in_hash_depends_file_name;
-
-            uint32_t temp_hash_reference_count =
-                    rpkgs.at(rpkg_index).hash.at(it->second).hash_reference_data.hash_reference_count & 0x3FFFFFFF;
-
-            for (uint64_t p = 0; p < temp_hash_reference_count; p++) {
-                uint64_t hash_reference_value = rpkgs.at(rpkg_index).hash.at(
-                        it->second).hash_reference_data.hash_reference.at(p);
-
-                uint32_t rpkg_index2 = rpkg_function::get_latest_hash(hash_reference_value);
-
-                if (rpkg_index2 != UINT32_MAX) {
-                    auto it2 = rpkgs.at(rpkg_index2).hash_map.find(hash_reference_value);
-
-                    if (it2 != rpkgs.at(rpkg_index2).hash_map.end()) {
-                        if (rpkgs.at(rpkg_index2).hash.at(it2->second).hash_resource_type == "TEMP") {
-                            map_recursive_temp_loader(rpkg_index2,
-                                                      rpkgs.at(rpkg_index2).hash.at(it2->second).hash_value);
-                        } else if (rpkgs.at(rpkg_index2).hash.at(it2->second).hash_resource_type == "ASET") {
-                            //std::cout << map_temps.at(temp_index).temp_file_name << " has ASET reference file: " << rpkgs.at(rpkg_index2).hash.at(it2->second).hash_file_name << std::endl;
-
-                            uint32_t temp_hash_reference_count2 = rpkgs.at(rpkg_index2).hash.at(
-                                    it2->second).hash_reference_data.hash_reference_count & 0x3FFFFFFF;
-
-                            for (uint64_t a = 0; a < temp_hash_reference_count2; a++) {
-                                uint64_t hash_reference_value2 = rpkgs.at(rpkg_index2).hash.at(
-                                        it2->second).hash_reference_data.hash_reference.at(a);
-
-                                uint32_t rpkg_index3 = rpkg_function::get_latest_hash(hash_reference_value2);
-
-                                if (rpkg_index3 != UINT32_MAX) {
-                                    auto it3 = rpkgs.at(rpkg_index3).hash_map.find(hash_reference_value2);
-
-                                    if (it3 != rpkgs.at(rpkg_index3).hash_map.end()) {
-                                        if (rpkgs.at(rpkg_index3).hash.at(it3->second).hash_resource_type == "TEMP") {
-                                            //std::cout << rpkgs.at(rpkg_index2).hash.at(it2->second).hash_file_name << " has TEMP reference file: " << rpkgs.at(rpkg_index3).hash.at(it3->second).hash_file_name << std::endl;
-
-                                            map_recursive_temp_loader(rpkg_index3, rpkgs.at(rpkg_index3).hash.at(
-                                                    it3->second).hash_value);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Recursively call if dependency is a TEMP file
+        if (dependency_hash_obj.hash_resource_type == "TEMP" || dependency_hash_obj.hash_resource_type == "ASET") {
+            map_recursive_temp_loader(dependency_rpkg_index, dependency_hash_obj);
         }
     }
 }
 
 bool map::matrixes_equal(matrix43& matrix1, matrix43& matrix2) {
     if (!util::floats_equal(matrix1.x_axis.x, matrix2.x_axis.x)) {
-        std::cout << matrix1.x_axis.x << ", " << matrix2.x_axis.x << std::endl;
+        std::cout << matrix1.x_axis.x << ", " << matrix2.x_axis.x << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.y_axis.x, matrix2.y_axis.x)) {
-        std::cout << matrix1.y_axis.x << ", " << matrix2.y_axis.x << std::endl;
+        std::cout << matrix1.y_axis.x << ", " << matrix2.y_axis.x << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.z_axis.x, matrix2.z_axis.x)) {
-        std::cout << matrix1.z_axis.x << ", " << matrix2.z_axis.x << std::endl;
+        std::cout << matrix1.z_axis.x << ", " << matrix2.z_axis.x << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.x_axis.y, matrix2.x_axis.y)) {
-        std::cout << matrix1.x_axis.y << ", " << matrix2.x_axis.y << std::endl;
+        std::cout << matrix1.x_axis.y << ", " << matrix2.x_axis.y << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.y_axis.y, matrix2.y_axis.y)) {
-        std::cout << matrix1.y_axis.y << ", " << matrix2.y_axis.y << std::endl;
+        std::cout << matrix1.y_axis.y << ", " << matrix2.y_axis.y << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.z_axis.y, matrix2.z_axis.y)) {
-        std::cout << matrix1.z_axis.y << ", " << matrix2.z_axis.y << std::endl;
+        std::cout << matrix1.z_axis.y << ", " << matrix2.z_axis.y << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.x_axis.z, matrix2.x_axis.z)) {
-        std::cout << matrix1.x_axis.z << ", " << matrix2.x_axis.z << std::endl;
+        std::cout << matrix1.x_axis.z << ", " << matrix2.x_axis.z << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.y_axis.z, matrix2.y_axis.z)) {
-        std::cout << matrix1.y_axis.z << ", " << matrix2.y_axis.z << std::endl;
+        std::cout << matrix1.y_axis.z << ", " << matrix2.y_axis.z << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.z_axis.z, matrix2.z_axis.z)) {
-        std::cout << matrix1.z_axis.z << ", " << matrix2.z_axis.z << std::endl;
+        std::cout << matrix1.z_axis.z << ", " << matrix2.z_axis.z << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.transform.x, matrix2.transform.x)) {
-        std::cout << matrix1.transform.x << ", " << matrix2.transform.x << std::endl;
+        std::cout << matrix1.transform.x << ", " << matrix2.transform.x << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.transform.y, matrix2.transform.y)) {
-        std::cout << matrix1.transform.y << ", " << matrix2.transform.y << std::endl;
+        std::cout << matrix1.transform.y << ", " << matrix2.transform.y << '\n';
         return false;
     }
     if (!util::floats_equal(matrix1.transform.z, matrix2.transform.z)) {
-        std::cout << matrix1.transform.z << ", " << matrix2.transform.z << std::endl;
+        std::cout << matrix1.transform.z << ", " << matrix2.transform.z << '\n';
         return false;
     }
 
