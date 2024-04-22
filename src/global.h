@@ -13,11 +13,11 @@
 
 #ifdef RPKG_CLI
 #include <iostream>
-#define LOG(x) std::cout << x << std::endl
+#define LOG(x) std::cout << x << '\n'
 #define LOG_NO_ENDL(x) std::cout << x
-#define LOG_AND_EXIT(x) std::cout << x << std::endl; if (interative_mode) { return; } else std::exit(0)
-#define LOG_AND_RETURN(x) std::cout << x << std::endl; return
-#define LOG_AND_EXIT_NOP(x) std::cout << x << std::endl; if (!interative_mode) std::exit(0)
+#define LOG_AND_EXIT(x) std::cout << x << '\n'; if (interative_mode) { return; } else std::exit(0)
+#define LOG_AND_RETURN(x) std::cout << x << '\n'; return
+#define LOG_AND_EXIT_NOP(x) std::cout << x << '\n'; if (!interative_mode) std::exit(0)
 #else
 #define LOG(x)
 #define LOG_NO_ENDL(x)
