@@ -151,26 +151,26 @@ void map::export_map(std::string& input_path, std::string& filter,
     temp_map.message = "Loading recursive TEMP/TBLU entities: ";
     timing_string = temp_map.message + "0% done";
 
-    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
+    for (uint64_t temp_i = 0; temp_i < temp_map.map_temps.size(); temp_i++) {
         if (gui_control == ABORT_CURRENT_TASK) { return; }
 
-        if (((t * (uint64_t) 10000) / (uint64_t) temp_map.map_temps.size()) % (uint64_t) 10 == 0 && t > 0) {
+        if (((temp_i * (uint64_t) 10'000) / (uint64_t) temp_map.map_temps.size()) % 10 == 0 && temp_i > 0) {
             temp_map.stringstream_length =
                     console::update_console(temp_map.message, temp_map.map_temps.size(),
-                                            t, temp_map.start_time, temp_map.stringstream_length);
+                                            temp_i, temp_map.start_time, temp_map.stringstream_length);
         }
-
         map_percent_progress_recursive_temp = percent_progress;
 
-        if (temp_map.map_temps.at(t).tblu_return_value == TEMP_TBLU_FOUND) {
-            temp_map.map_temps.at(t).load_data();
+        temp& current_temp = temp_map.map_temps.at(temp_i);
+        if (current_temp.tblu_return_value == TEMP_TBLU_FOUND) {
+            current_temp.load_data();
         }
     }
 
     temp_map.end_time = std::chrono::high_resolution_clock::now();
     std::stringstream ss;
     ss << temp_map.message << "100% Done in " << (
-            0.000000001 *
+            0.00'000'000'1 *
             std::chrono::duration_cast<std::chrono::duration<double>>(
                     temp_map.end_time - temp_map.start_time).count()) << "s";
     LOG("\r" << ss.str() << std::string((temp_map.stringstream_length - ss.str().length()), ' '));
@@ -180,37 +180,25 @@ void map::export_map(std::string& input_path, std::string& filter,
 
     temp_map.get_root_scenes();
 
-    //std::unordered_map<uint64_t, uint64_t>::iterator it;
-
-    //for (it = temp_map.root_scenes.begin(); it != temp_map.root_scenes.end(); ++it)
-    //{
-    //std::cout << "Root scenes (TEMPs): " << util::uint64_t_to_hex_string(it->first) << std::endl;
-    //}
-
     task_map_status = MAP_GET_MAP_NODES_EXECUTING;
-
     LOG("Calculating number of map nodes...");
     timing_string = "Calculating number of map node...";
     temp_map.map_node_count = 0;
-
-    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
-        const rapidjson::Value& temp_json_subEntities = temp_map.map_temps.at(t).temp_json_document["subEntities"];
-
+    for (temp& map_temp : temp_map.map_temps) {
+        const rapidjson::Value& temp_json_subEntities = map_temp.temp_json_document["subEntities"];
         temp_map.map_node_count += temp_json_subEntities.Size();
     }
-
     LOG("Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count));
     timing_string = "Number of map nodes found: " + util::uint32_t_to_string(temp_map.map_node_count);
     temp_map.start_time = std::chrono::high_resolution_clock::now();
     temp_map.stringstream_length = 80;
+
     temp_map.message = "Loading map nodes: ";
     timing_string = temp_map.message + "0% done";
     temp_map.map_node_count_current = 0;
-
-    for (uint64_t t = 0; t < temp_map.map_temps.size(); t++) {
-        temp_map.get_map_node(temp_map.map_temps.at(t));
+    for (temp& map_temp : temp_map.map_temps) {
+        temp_map.get_map_node(map_temp);
     }
-
     temp_map.end_time = std::chrono::high_resolution_clock::now();
     ss.str(std::string(""));
     ss << temp_map.message << "100% Done in " << (0.000000001 *
@@ -225,8 +213,8 @@ void map::export_map(std::string& input_path, std::string& filter,
     timing_string = "Calculating number of map node with PRIMs...";
     temp_map.map_node_prim_count = 0;
 
-    for (uint64_t m = 0; m < temp_map.map_nodes.size(); m++) {
-        if (temp_map.map_nodes.at(m).has_prim_resource) {
+    for (auto& map_node : temp_map.map_nodes) {
+        if (map_node.has_prim_resource) {
             temp_map.map_node_prim_count++;
         }
     }
@@ -234,6 +222,7 @@ void map::export_map(std::string& input_path, std::string& filter,
     LOG("Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count));
     timing_string =
             "Number of map nodes with PRIMs found: " + util::uint32_t_to_string(temp_map.map_node_prim_count);
+
     temp_map.start_time = std::chrono::high_resolution_clock::now();
     temp_map.stringstream_length = 80;
     temp_map.message = "Extracting all map's PRIMs as GLBs: ";
@@ -399,8 +388,8 @@ void map::export_map(std::string& input_path, std::string& filter,
     timing_string = temp_map.message + "0% done";
     temp_map.map_node_count_current = 0;
 
-    for (uint32_t m = 0; m < temp_map.map_root_nodes.size(); m++) {
-        temp_map.generate_map_node_strings(temp_map.map_root_nodes.at(m), 0, "", 0);
+    for (auto& map_root_node : temp_map.map_root_nodes) {
+        temp_map.generate_map_node_strings(map_root_node, 0, "", 1);
     }
 
     /*std::string UE5_file = "map_root_nodes=";
@@ -1850,6 +1839,7 @@ void map::extract_map_prims(std::string output_path, bool textured) {
 
                     std::string prim_hash_string = util::uint64_t_to_hex_string(map_node.prim_hash);
 
+                    /*
                     if (it2 != rpkgs.at(rpkg_index).hash_map.end()) {
                         if (textured) {
                             rpkg_function::extract_prim_textured_from(rpkgs.at(rpkg_index).rpkg_file_path,
@@ -1859,6 +1849,7 @@ void map::extract_map_prims(std::string output_path, bool textured) {
                                                              output_path, GLB_SINGLE, false);
                         }
                     }
+                     */
 
                     if (file::path_exists(file::output_path_append(prim_hash_string + ".PRIM.glb", output_path))) {
                         map_prims_map[map_node.prim_hash] = map_prims_map.size();
